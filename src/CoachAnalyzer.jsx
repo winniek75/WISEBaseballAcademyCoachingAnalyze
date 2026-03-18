@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { FFmpeg } from "@ffmpeg/ffmpeg";
+import { fetchFile, toBlobURL } from "@ffmpeg/util";
 
 const TOOLS = {
   POINTER: "pointer", ARROW: "arrow", LINE: "line",
@@ -11,6 +13,7 @@ const SPEEDS = [
 ];
 const PRESET_COLORS = ["#00e676", "#ff1744", "#ffea00", "#40c4ff", "#ff6d00", "#e040fb", "#ffffff"];
 
+// ── Drawing helpers ──────────────────────────────────────────────
 function drawArrow(ctx, x1, y1, x2, y2, color, lw) {
   const head = Math.max(18, lw * 5);
   const ang = Math.atan2(y2 - y1, x2 - x1);
@@ -75,6 +78,7 @@ function renderShape(ctx, shape) {
   ctx.restore();
 }
 
+// ── Main Component ───────────────────────────────────────────────
 export default function CoachAnalyzer() {
   const [videoSrc, setVideoSrc] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -95,10 +99,17 @@ export default function CoachAnalyzer() {
   const [videoSize, setVideoSize] = useState({ w: 1280, h: 720 });
   const [textInput, setTextInput] = useState("");
   const [textPos, setTextPos] = useState(null);
-  const [recState, setRecState] = useState("idle");
+
+  // Recording
+  const [recState, setRecState] = useState("idle"); // idle | recording | preview
   const [recBlob, setRecBlob] = useState(null);
   const [recTime, setRecTime] = useState(0);
   const [micError, setMicError] = useState(false);
+
+  // FFmpeg conversion
+  const [convState, setConvState] = useState("idle"); // idle | loading | converting | done | error
+  const [convProgress, setConvProgress] = useState(0);
+  const [convMessage, setConvMessage] = useState("");
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -109,6 +120,7 @@ export default function CoachAnalyzer() {
   const recTimerRef = useRef(null);
   const rafRef = useRef(null);
   const annotationsRef = useRef(annotations);
+  const ffmpegRef = useRef(null);
 
   useEffect(() => { annotationsRef.current = annotations; }, [annotations]);
   useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = speed; }, [speed]);
@@ -120,22 +132,19 @@ export default function CoachAnalyzer() {
     annotations.forEach(s => renderShape(ctx, s));
     if (currentShape) renderShape(ctx, currentShape);
   }, [annotations, currentShape]);
-
   useEffect(() => { redraw(); }, [redraw]);
 
   const getPos = (e) => {
     const c = canvasRef.current; if (!c) return { x: 0, y: 0 };
     const r = c.getBoundingClientRect();
-    const scaleX = c.width / r.width;
-    const scaleY = c.height / r.height;
+    const scaleX = c.width / r.width, scaleY = c.height / r.height;
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
     return { x: (clientX - r.left) * scaleX, y: (clientY - r.top) * scaleY };
   };
 
   const pushUndo = (ann) => {
-    const s = undoStack.slice(0, undoIndex + 1);
-    s.push([...ann]);
+    const s = undoStack.slice(0, undoIndex + 1); s.push([...ann]);
     setUndoStack(s); setUndoIndex(s.length - 1);
   };
   const undo = () => { if (undoIndex > 0) { const i = undoIndex - 1; setUndoIndex(i); setAnnotations([...undoStack[i]]); } };
@@ -146,17 +155,12 @@ export default function CoachAnalyzer() {
     if (tool === TOOLS.POINTER) return;
     e.preventDefault();
     const pos = getPos(e);
-    if (tool === TOOLS.TEXT) {
-      setTextPos(pos); setTextInput("");
-      setTimeout(() => textInputRef.current?.focus(), 50);
-      return;
-    }
+    if (tool === TOOLS.TEXT) { setTextPos(pos); setTextInput(""); setTimeout(() => textInputRef.current?.focus(), 50); return; }
     if (tool === TOOLS.ANGLE) {
       const pts = [...anglePoints, pos];
       if (pts.length === 3) {
         const shape = { type: TOOLS.ANGLE, points: pts, color, strokeWidth };
-        const next = [...annotations, shape];
-        setAnnotations(next); pushUndo(next);
+        const next = [...annotations, shape]; setAnnotations(next); pushUndo(next);
         setAnglePoints([]); setCurrentShape(null);
       } else { setAnglePoints(pts); setCurrentShape({ type: TOOLS.ANGLE, points: pts, color, strokeWidth }); }
       return;
@@ -170,9 +174,7 @@ export default function CoachAnalyzer() {
     if (tool === TOOLS.POINTER || tool === TOOLS.TEXT) return;
     e.preventDefault();
     const pos = getPos(e);
-    if (tool === TOOLS.ANGLE && anglePoints.length > 0) {
-      setCurrentShape({ type: TOOLS.ANGLE, points: [...anglePoints, pos], color, strokeWidth }); return;
-    }
+    if (tool === TOOLS.ANGLE && anglePoints.length > 0) { setCurrentShape({ type: TOOLS.ANGLE, points: [...anglePoints, pos], color, strokeWidth }); return; }
     if (!isDrawing) return;
     if (tool === TOOLS.FREEHAND) setCurrentShape(p => ({ ...p, points: [...p.points, pos] }));
     else setCurrentShape(p => ({ ...p, x2: pos.x, y2: pos.y }));
@@ -194,10 +196,7 @@ export default function CoachAnalyzer() {
 
   const togglePlay = async () => {
     const v = videoRef.current; if (!v) return;
-    try {
-      if (v.paused) { await v.play(); }
-      else { v.pause(); }
-    } catch (err) { console.error("Playback error:", err); }
+    try { if (v.paused) { await v.play(); } else { v.pause(); } } catch (err) { console.error(err); }
   };
 
   const stepFrame = (fwd) => {
@@ -216,8 +215,7 @@ export default function CoachAnalyzer() {
 
   const handleTimeUpdate = () => {
     const v = videoRef.current; if (!v || !v.duration) return;
-    setCurrentTime(v.currentTime);
-    setProgress(v.currentTime / v.duration * 100);
+    setCurrentTime(v.currentTime); setProgress(v.currentTime / v.duration * 100);
   };
 
   const seek = (e) => {
@@ -238,14 +236,13 @@ export default function CoachAnalyzer() {
     a.href = ec.toDataURL("image/png"); a.click();
   };
 
+  // ── Recording ──
   const startRecording = async () => {
     const v = videoRef.current, c = canvasRef.current; if (!v || !c) return;
     setMicError(false);
-
     const recCanvas = document.createElement("canvas");
     recCanvas.width = c.width; recCanvas.height = c.height;
     const rCtx = recCanvas.getContext("2d");
-
     const drawLoop = () => {
       rCtx.clearRect(0, 0, recCanvas.width, recCanvas.height);
       rCtx.drawImage(v, 0, 0, recCanvas.width, recCanvas.height);
@@ -253,30 +250,21 @@ export default function CoachAnalyzer() {
       rafRef.current = requestAnimationFrame(drawLoop);
     };
     drawLoop();
-
     const tracks = [];
-    const canvasStream = recCanvas.captureStream(30);
-    canvasStream.getTracks().forEach(t => tracks.push(t));
-
+    recCanvas.captureStream(30).getTracks().forEach(t => tracks.push(t));
     try {
-      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      micStream.getAudioTracks().forEach(t => tracks.push(t));
-    } catch {
-      setMicError(true);
-    }
-
-    const combined = new MediaStream(tracks);
-    const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
-      ? "video/webm;codecs=vp9,opus"
+      const mic = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      mic.getAudioTracks().forEach(t => tracks.push(t));
+    } catch { setMicError(true); }
+    const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus") ? "video/webm;codecs=vp9,opus"
       : MediaRecorder.isTypeSupported("video/webm") ? "video/webm" : "";
-
-    const rec = new MediaRecorder(combined, mimeType ? { mimeType } : {});
+    const rec = new MediaRecorder(new MediaStream(tracks), mimeType ? { mimeType } : {});
     recChunksRef.current = [];
     rec.ondataavailable = e => { if (e.data.size > 0) recChunksRef.current.push(e.data); };
     rec.onstop = () => {
       cancelAnimationFrame(rafRef.current);
-      const blob = new Blob(recChunksRef.current, { type: "video/webm" });
-      setRecBlob(blob); setRecState("preview");
+      setRecBlob(new Blob(recChunksRef.current, { type: "video/webm" }));
+      setRecState("preview");
       clearInterval(recTimerRef.current);
     };
     rec.start(100);
@@ -285,12 +273,60 @@ export default function CoachAnalyzer() {
     recTimerRef.current = setInterval(() => setRecTime(t => t + 1), 1000);
   };
 
-  const stopRecording = () => {
-    recorderRef.current?.stop();
-    clearInterval(recTimerRef.current);
+  const stopRecording = () => { recorderRef.current?.stop(); clearInterval(recTimerRef.current); };
+
+  // ── FFmpeg MP4 conversion ──
+  const convertToMp4 = async () => {
+    if (!recBlob) return;
+    setConvState("loading"); setConvProgress(0); setConvMessage("FFmpegを読み込み中...");
+    try {
+      if (!ffmpegRef.current) {
+        const ffmpeg = new FFmpeg();
+        ffmpeg.on("progress", ({ progress }) => {
+          setConvProgress(Math.round(progress * 100));
+          setConvMessage(`変換中... ${Math.round(progress * 100)}%`);
+        });
+        ffmpeg.on("log", ({ message }) => console.log("[ffmpeg]", message));
+        const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
+        await ffmpeg.load({
+          coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+          wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+        });
+        ffmpegRef.current = ffmpeg;
+      }
+      const ffmpeg = ffmpegRef.current;
+      setConvState("converting"); setConvMessage("変換中... 0%");
+      await ffmpeg.writeFile("input.webm", await fetchFile(recBlob));
+      // -vf scale: ensure width/height are divisible by 2 (MP4/H.264 requirement)
+      await ffmpeg.exec([
+        "-i", "input.webm",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-movflags", "+faststart",
+        "output.mp4"
+      ]);
+      const data = await ffmpeg.readFile("output.mp4");
+      const mp4Blob = new Blob([data.buffer], { type: "video/mp4" });
+      const url = URL.createObjectURL(mp4Blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `wise-coaching-${Date.now()}.mp4`; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      // cleanup ffmpeg virtual FS
+      try { await ffmpeg.deleteFile("input.webm"); await ffmpeg.deleteFile("output.mp4"); } catch {}
+      setConvState("done"); setConvMessage("MP4変換完了！LINEで送信できます");
+      setTimeout(() => { setConvState("idle"); setConvMessage(""); setConvProgress(0); }, 4000);
+    } catch (err) {
+      console.error("FFmpeg error:", err);
+      setConvState("error"); setConvMessage("変換に失敗しました。もう一度お試しください。");
+      setTimeout(() => { setConvState("idle"); setConvMessage(""); }, 4000);
+    }
   };
 
-  const downloadRecording = () => {
+  const downloadWebm = () => {
     if (!recBlob) return;
     const url = URL.createObjectURL(recBlob);
     const a = document.createElement("a");
@@ -298,7 +334,7 @@ export default function CoachAnalyzer() {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   };
 
-  const discardRecording = () => { setRecBlob(null); setRecState("idle"); setRecTime(0); };
+  const discardRecording = () => { setRecBlob(null); setRecState("idle"); setRecTime(0); setConvState("idle"); setConvMessage(""); };
 
   const handleFile = (e) => {
     const file = e.target.files[0]; if (!file) return;
@@ -306,7 +342,7 @@ export default function CoachAnalyzer() {
     setAnnotations([]); setUndoStack([[]]); setUndoIndex(0);
     setAnglePoints([]); setCurrentShape(null); setTextPos(null);
     setIsPlaying(false); setProgress(0); setCurrentTime(0); setDuration(0);
-    setRecState("idle"); setRecBlob(null);
+    setRecState("idle"); setRecBlob(null); setConvState("idle");
     e.target.value = "";
   };
 
@@ -334,6 +370,7 @@ export default function CoachAnalyzer() {
     { id: TOOLS.TEXT,     icon: "T",  label: "テキスト" },
   ];
 
+  const isConverting = convState === "loading" || convState === "converting";
   const cursor = tool === TOOLS.POINTER ? "default" : tool === TOOLS.TEXT ? "text" : "crosshair";
 
   return (
@@ -362,10 +399,26 @@ export default function CoachAnalyzer() {
               </>
             )}
             {recState === "preview" && (
-              <>
-                <button onClick={downloadRecording} style={S.btnPrimary}>📥 動画DL (LINE送信用)</button>
-                <button onClick={discardRecording} style={S.btn}>✕ 破棄</button>
-              </>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                {/* MP4 convert button */}
+                {!isConverting && convState !== "done" && (
+                  <button onClick={convertToMp4} style={{ ...S.btnPrimary, background: "linear-gradient(135deg,#40c4ff,#0091ea)" }}>
+                    📱 MP4変換 (iPhone対応)
+                  </button>
+                )}
+                {isConverting && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ width: 100, height: 6, background: "#21262d", borderRadius: 3, overflow: "hidden" }}>
+                      <div style={{ width: `${convProgress}%`, height: "100%", background: "linear-gradient(90deg,#40c4ff,#0091ea)", transition: "width 0.3s", borderRadius: 3 }} />
+                    </div>
+                    <span style={{ fontSize: 11, color: "#40c4ff" }}>{convMessage}</span>
+                  </div>
+                )}
+                {convState === "done" && <span style={{ fontSize: 11, color: "#00e676", fontWeight: 700 }}>✅ {convMessage}</span>}
+                {convState === "error" && <span style={{ fontSize: 11, color: "#ff4444" }}>❌ {convMessage}</span>}
+                <button onClick={downloadWebm} style={{ ...S.btn, fontSize: 11 }}>⬇ WebMで保存</button>
+                <button onClick={discardRecording} style={{ ...S.btn, color: "#6e7681" }}>✕ 破棄</button>
+              </div>
             )}
             <div style={S.divider} />
             <button onClick={exportFrame} style={S.btnPrimary}>📸 フレーム保存</button>
@@ -416,42 +469,34 @@ export default function CoachAnalyzer() {
                 <div style={{ fontSize: 52, marginBottom: 14 }}>🎬</div>
                 <div style={{ fontSize: 18, fontWeight: 700, color: isDragging ? "#00e676" : "#c9d1d9", marginBottom: 8 }}>動画をドロップ</div>
                 <div style={{ fontSize: 12, color: "#6e7681", marginBottom: 14 }}>またはクリックしてファイル選択</div>
-                <div style={{ display: "flex", gap: 6, justifyContent: "center", flexWrap: "wrap", marginBottom: 20 }}>
+                <div style={{ display: "flex", gap: 6, justifyContent: "center", marginBottom: 20 }}>
                   {["MP4", "MOV", "AVI", "M4V"].map(f => <span key={f} style={S.badge}>{f}</span>)}
                 </div>
-                <div style={{ padding: "12px 18px", background: "rgba(0,230,118,0.07)", borderRadius: 8, borderLeft: "3px solid #00e676", textAlign: "left", maxWidth: 300 }}>
-                  <div style={{ fontSize: 11, color: "#00e676", fontWeight: 700, marginBottom: 5 }}>🎙 解説録画機能</div>
+                <div style={{ padding: "12px 18px", background: "rgba(64,196,255,0.07)", borderRadius: 8, borderLeft: "3px solid #40c4ff", textAlign: "left", maxWidth: 300 }}>
+                  <div style={{ fontSize: 11, color: "#40c4ff", fontWeight: 700, marginBottom: 5 }}>📱 iPhone対応MP4出力</div>
                   <div style={{ fontSize: 11, color: "#8b949e", lineHeight: 1.7 }}>
-                    動画を見ながらコーチが音声解説を録音。<br />
-                    描画＋解説入り動画をLINEで共有できます。
+                    解説録画後にブラウザ内でMP4変換。<br />
+                    iPhoneのLINEで再生できる形式で保存。
                   </div>
                 </div>
               </div>
             </div>
           ) : (
             <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-              {/* Video + Canvas */}
               <div style={{ flex: 1, position: "relative", display: "flex", alignItems: "center", justifyContent: "center", background: "#000", overflow: "hidden" }}>
                 <div style={{ position: "relative", display: "inline-block", maxWidth: "100%", maxHeight: "calc(100vh - 170px)" }}>
                   <video
-                    ref={videoRef}
-                    src={videoSrc}
+                    ref={videoRef} src={videoSrc}
                     style={{ display: "block", maxWidth: "100%", maxHeight: "calc(100vh - 170px)", objectFit: "contain" }}
-                    onLoadedMetadata={handleVideoLoad}
-                    onTimeUpdate={handleTimeUpdate}
-                    onEnded={() => setIsPlaying(false)}
-                    onPlay={() => setIsPlaying(true)}
-                    onPause={() => setIsPlaying(false)}
-                    playsInline
-                    preload="auto"
+                    onLoadedMetadata={handleVideoLoad} onTimeUpdate={handleTimeUpdate}
+                    onEnded={() => setIsPlaying(false)} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)}
+                    playsInline preload="auto"
                   />
-                  <canvas
-                    ref={canvasRef}
+                  <canvas ref={canvasRef}
                     style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", cursor }}
                     onMouseDown={handleDown} onMouseMove={handleMove} onMouseUp={handleUp} onMouseLeave={handleUp}
                     onTouchStart={handleDown} onTouchMove={handleMove} onTouchEnd={handleUp}
                   />
-                  {/* Text input overlay */}
                   {textPos && (
                     <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none" }}>
                       <div style={{ position: "absolute", top: `${textPos.y / videoSize.h * 100}%`, left: `${textPos.x / videoSize.w * 100}%`, pointerEvents: "all" }}>
@@ -464,11 +509,9 @@ export default function CoachAnalyzer() {
                       </div>
                     </div>
                   )}
-                  {/* Angle hint */}
                   {tool === TOOLS.ANGLE && anglePoints.length > 0 && (
                     <div style={S.hint}>{anglePoints.length === 1 ? "▶ 頂点をクリック" : "▶ 2本目の辺をクリック"}</div>
                   )}
-                  {/* Rec indicator */}
                   {recState === "recording" && (
                     <div style={{ position: "absolute", top: 10, right: 10, background: "rgba(200,0,0,0.85)", borderRadius: 6, padding: "4px 10px", fontSize: 12, color: "#fff", fontWeight: 700 }}>
                       ● REC {fmtRec(recTime)}
@@ -521,7 +564,7 @@ export default function CoachAnalyzer() {
           <span>速度: {speed}x</span>
           <span>ツール: {toolDefs.find(t => t.id === tool)?.label}</span>
           <span>描画: {annotations.length}</span>
-          {recState === "preview" && <span style={{ color: "#00e676" }}>✅ 録画完了 - ダウンロードしてLINEで送信</span>}
+          {isConverting && <span style={{ color: "#40c4ff" }}>{convMessage}</span>}
         </div>
       )}
     </div>
