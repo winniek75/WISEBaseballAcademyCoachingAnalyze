@@ -1,27 +1,33 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 
-const TOOLS = { POINTER: "pointer", ARROW: "arrow", LINE: "line", CIRCLE: "circle", RECT: "rect", ANGLE: "angle", FREEHAND: "freehand" };
-const SPEEDS = [{ label: "1/10", value: 0.1 }, { label: "1/4", value: 0.25 }, { label: "1/2", value: 0.5 }, { label: "3/4", value: 0.75 }, { label: "等速", value: 1 }];
+const TOOLS = {
+  POINTER: "pointer", ARROW: "arrow", LINE: "line",
+  CIRCLE: "circle", RECT: "rect", ANGLE: "angle",
+  FREEHAND: "freehand", TEXT: "text",
+};
+const SPEEDS = [
+  { label: "1/10", value: 0.1 }, { label: "1/4", value: 0.25 },
+  { label: "1/2", value: 0.5 }, { label: "3/4", value: 0.75 }, { label: "等速", value: 1 },
+];
 const PRESET_COLORS = ["#00e676", "#ff1744", "#ffea00", "#40c4ff", "#ff6d00", "#e040fb", "#ffffff"];
 
-function drawArrow(ctx, x1, y1, x2, y2, color, width) {
-  const headLen = Math.max(18, width * 5);
-  const angle = Math.atan2(y2 - y1, x2 - x1);
-  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width;
+function drawArrow(ctx, x1, y1, x2, y2, color, lw) {
+  const head = Math.max(18, lw * 5);
+  const ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw;
   ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
   ctx.beginPath();
   ctx.moveTo(x2, y2);
-  ctx.lineTo(x2 - headLen * Math.cos(angle - Math.PI / 6), y2 - headLen * Math.sin(angle - Math.PI / 6));
-  ctx.lineTo(x2 - headLen * Math.cos(angle + Math.PI / 6), y2 - headLen * Math.sin(angle + Math.PI / 6));
+  ctx.lineTo(x2 - head * Math.cos(ang - Math.PI / 6), y2 - head * Math.sin(ang - Math.PI / 6));
+  ctx.lineTo(x2 - head * Math.cos(ang + Math.PI / 6), y2 - head * Math.sin(ang + Math.PI / 6));
   ctx.closePath(); ctx.fill();
 }
 
-function calcAngle(p1, vertex, p2) {
-  const a = Math.atan2(p1.y - vertex.y, p1.x - vertex.x);
-  const b = Math.atan2(p2.y - vertex.y, p2.x - vertex.x);
-  let deg = Math.abs((b - a) * 180 / Math.PI);
-  if (deg > 180) deg = 360 - deg;
-  return Math.round(deg);
+function calcAngle(p1, v, p2) {
+  const a = Math.atan2(p1.y - v.y, p1.x - v.x);
+  const b = Math.atan2(p2.y - v.y, p2.x - v.x);
+  let d = Math.abs((b - a) * 180 / Math.PI);
+  return Math.round(d > 180 ? 360 - d : d);
 }
 
 function renderShape(ctx, shape) {
@@ -52,10 +58,17 @@ function renderShape(ctx, shape) {
         if (shape.points.length === 3) {
           const deg = calcAngle(shape.points[0], shape.points[1], shape.points[2]);
           ctx.font = `bold ${Math.max(16, shape.strokeWidth * 5)}px 'Courier New', monospace`;
-          ctx.fillStyle = shape.color;
-          ctx.shadowColor = "rgba(0,0,0,0.8)"; ctx.shadowBlur = 4;
-          ctx.fillText(`${deg}°`, shape.points[1].x + 8, shape.points[1].y - 8);
+          ctx.fillStyle = shape.color; ctx.shadowColor = "rgba(0,0,0,0.8)"; ctx.shadowBlur = 4;
+          ctx.fillText(`${deg}deg`, shape.points[1].x + 8, shape.points[1].y - 8);
         }
+      } break;
+    case TOOLS.TEXT:
+      if (shape.text) {
+        const fs = Math.max(16, shape.strokeWidth * 6);
+        ctx.font = `bold ${fs}px 'Courier New', monospace`;
+        ctx.fillStyle = shape.color;
+        ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 5;
+        shape.text.split("\n").forEach((line, i) => ctx.fillText(line, shape.x1, shape.y1 + i * (fs + 4)));
       } break;
     default: break;
   }
@@ -80,12 +93,24 @@ export default function CoachAnalyzer() {
   const [currentTime, setCurrentTime] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
   const [videoSize, setVideoSize] = useState({ w: 1280, h: 720 });
+  const [textInput, setTextInput] = useState("");
+  const [textPos, setTextPos] = useState(null);
+  const [recState, setRecState] = useState("idle");
+  const [recBlob, setRecBlob] = useState(null);
+  const [recTime, setRecTime] = useState(0);
+  const [micError, setMicError] = useState(false);
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
-  const animRef = useRef(null);
+  const textInputRef = useRef(null);
+  const recorderRef = useRef(null);
+  const recChunksRef = useRef([]);
+  const recTimerRef = useRef(null);
+  const rafRef = useRef(null);
+  const annotationsRef = useRef(annotations);
 
+  useEffect(() => { annotationsRef.current = annotations; }, [annotations]);
   useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = speed; }, [speed]);
 
   const redraw = useCallback(() => {
@@ -101,7 +126,11 @@ export default function CoachAnalyzer() {
   const getPos = (e) => {
     const c = canvasRef.current; if (!c) return { x: 0, y: 0 };
     const r = c.getBoundingClientRect();
-    return { x: (e.clientX - r.left) * (c.width / r.width), y: (e.clientY - r.top) * (c.height / r.height) };
+    const scaleX = c.width / r.width;
+    const scaleY = c.height / r.height;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    return { x: (clientX - r.left) * scaleX, y: (clientY - r.top) * scaleY };
   };
 
   const pushUndo = (ann) => {
@@ -109,10 +138,19 @@ export default function CoachAnalyzer() {
     s.push([...ann]);
     setUndoStack(s); setUndoIndex(s.length - 1);
   };
+  const undo = () => { if (undoIndex > 0) { const i = undoIndex - 1; setUndoIndex(i); setAnnotations([...undoStack[i]]); } };
+  const redo = () => { if (undoIndex < undoStack.length - 1) { const i = undoIndex + 1; setUndoIndex(i); setAnnotations([...undoStack[i]]); } };
+  const clearAll = () => { setAnnotations([]); setAnglePoints([]); setCurrentShape(null); setTextPos(null); pushUndo([]); };
 
   const handleDown = (e) => {
     if (tool === TOOLS.POINTER) return;
+    e.preventDefault();
     const pos = getPos(e);
+    if (tool === TOOLS.TEXT) {
+      setTextPos(pos); setTextInput("");
+      setTimeout(() => textInputRef.current?.focus(), 50);
+      return;
+    }
     if (tool === TOOLS.ANGLE) {
       const pts = [...anglePoints, pos];
       if (pts.length === 3) {
@@ -129,6 +167,8 @@ export default function CoachAnalyzer() {
   };
 
   const handleMove = (e) => {
+    if (tool === TOOLS.POINTER || tool === TOOLS.TEXT) return;
+    e.preventDefault();
     const pos = getPos(e);
     if (tool === TOOLS.ANGLE && anglePoints.length > 0) {
       setCurrentShape({ type: TOOLS.ANGLE, points: [...anglePoints, pos], color, strokeWidth }); return;
@@ -139,46 +179,51 @@ export default function CoachAnalyzer() {
   };
 
   const handleUp = () => {
-    if (!isDrawing || tool === TOOLS.POINTER || tool === TOOLS.ANGLE) return;
+    if (!isDrawing || tool === TOOLS.POINTER || tool === TOOLS.ANGLE || tool === TOOLS.TEXT) return;
     if (currentShape) { const next = [...annotations, currentShape]; setAnnotations(next); pushUndo(next); }
     setIsDrawing(false); setCurrentShape(null);
   };
 
-  const undo = () => {
-    if (undoIndex > 0) { const i = undoIndex - 1; setUndoIndex(i); setAnnotations([...undoStack[i]]); }
+  const commitText = () => {
+    if (textPos && textInput.trim()) {
+      const shape = { type: TOOLS.TEXT, x1: textPos.x, y1: textPos.y, text: textInput.trim(), color, strokeWidth };
+      const next = [...annotations, shape]; setAnnotations(next); pushUndo(next);
+    }
+    setTextPos(null); setTextInput("");
   };
-  const redo = () => {
-    if (undoIndex < undoStack.length - 1) { const i = undoIndex + 1; setUndoIndex(i); setAnnotations([...undoStack[i]]); }
-  };
-  const clearAll = () => { setAnnotations([]); setAnglePoints([]); setCurrentShape(null); pushUndo([]); };
 
-  const togglePlay = () => {
+  const togglePlay = async () => {
     const v = videoRef.current; if (!v) return;
-    if (v.paused) { v.play(); setIsPlaying(true); } else { v.pause(); setIsPlaying(false); }
+    try {
+      if (v.paused) { await v.play(); }
+      else { v.pause(); }
+    } catch (err) { console.error("Playback error:", err); }
   };
 
   const stepFrame = (fwd) => {
     const v = videoRef.current; if (!v) return;
-    v.pause(); setIsPlaying(false); v.currentTime += fwd ? 1 / 30 : -1 / 30;
+    v.pause();
+    v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + (fwd ? 1 / 30 : -1 / 30)));
   };
 
   const handleVideoLoad = () => {
     const v = videoRef.current, c = canvasRef.current; if (!v || !c) return;
-    c.width = v.videoWidth; c.height = v.videoHeight;
+    c.width = v.videoWidth || 1280; c.height = v.videoHeight || 720;
     setVideoSize({ w: v.videoWidth, h: v.videoHeight });
-    setDuration(v.duration);
+    setDuration(v.duration || 0);
+    v.playbackRate = speed;
   };
 
   const handleTimeUpdate = () => {
-    const v = videoRef.current; if (!v) return;
-    setCurrentTime(v.currentTime); setProgress(v.currentTime / v.duration * 100);
+    const v = videoRef.current; if (!v || !v.duration) return;
+    setCurrentTime(v.currentTime);
+    setProgress(v.currentTime / v.duration * 100);
   };
 
   const seek = (e) => {
-    const v = videoRef.current; if (!v) return;
+    const v = videoRef.current; if (!v || !v.duration) return;
     const r = e.currentTarget.getBoundingClientRect();
-    const pct = (e.clientX - r.left) / r.width;
-    v.currentTime = pct * v.duration; setProgress(pct * 100);
+    v.currentTime = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * v.duration;
   };
 
   const exportFrame = () => {
@@ -187,114 +232,199 @@ export default function CoachAnalyzer() {
     ec.width = c.width; ec.height = c.height;
     const ctx = ec.getContext("2d");
     ctx.drawImage(v, 0, 0, c.width, c.height);
-    annotations.forEach(s => renderShape(ctx, s));
+    annotationsRef.current.forEach(s => renderShape(ctx, s));
     const a = document.createElement("a");
     a.download = `wise-coaching-${Date.now()}.png`;
     a.href = ec.toDataURL("image/png"); a.click();
   };
 
+  const startRecording = async () => {
+    const v = videoRef.current, c = canvasRef.current; if (!v || !c) return;
+    setMicError(false);
+
+    const recCanvas = document.createElement("canvas");
+    recCanvas.width = c.width; recCanvas.height = c.height;
+    const rCtx = recCanvas.getContext("2d");
+
+    const drawLoop = () => {
+      rCtx.clearRect(0, 0, recCanvas.width, recCanvas.height);
+      rCtx.drawImage(v, 0, 0, recCanvas.width, recCanvas.height);
+      annotationsRef.current.forEach(s => renderShape(rCtx, s));
+      rafRef.current = requestAnimationFrame(drawLoop);
+    };
+    drawLoop();
+
+    const tracks = [];
+    const canvasStream = recCanvas.captureStream(30);
+    canvasStream.getTracks().forEach(t => tracks.push(t));
+
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      micStream.getAudioTracks().forEach(t => tracks.push(t));
+    } catch {
+      setMicError(true);
+    }
+
+    const combined = new MediaStream(tracks);
+    const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+      ? "video/webm;codecs=vp9,opus"
+      : MediaRecorder.isTypeSupported("video/webm") ? "video/webm" : "";
+
+    const rec = new MediaRecorder(combined, mimeType ? { mimeType } : {});
+    recChunksRef.current = [];
+    rec.ondataavailable = e => { if (e.data.size > 0) recChunksRef.current.push(e.data); };
+    rec.onstop = () => {
+      cancelAnimationFrame(rafRef.current);
+      const blob = new Blob(recChunksRef.current, { type: "video/webm" });
+      setRecBlob(blob); setRecState("preview");
+      clearInterval(recTimerRef.current);
+    };
+    rec.start(100);
+    recorderRef.current = rec;
+    setRecState("recording"); setRecTime(0);
+    recTimerRef.current = setInterval(() => setRecTime(t => t + 1), 1000);
+  };
+
+  const stopRecording = () => {
+    recorderRef.current?.stop();
+    clearInterval(recTimerRef.current);
+  };
+
+  const downloadRecording = () => {
+    if (!recBlob) return;
+    const url = URL.createObjectURL(recBlob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `wise-coaching-${Date.now()}.webm`; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+
+  const discardRecording = () => { setRecBlob(null); setRecState("idle"); setRecTime(0); };
+
   const handleFile = (e) => {
     const file = e.target.files[0]; if (!file) return;
     setVideoSrc(URL.createObjectURL(file));
     setAnnotations([]); setUndoStack([[]]); setUndoIndex(0);
-    setAnglePoints([]); setCurrentShape(null); setIsPlaying(false);
+    setAnglePoints([]); setCurrentShape(null); setTextPos(null);
+    setIsPlaying(false); setProgress(0); setCurrentTime(0); setDuration(0);
+    setRecState("idle"); setRecBlob(null);
+    e.target.value = "";
   };
 
   const handleDrop = (e) => {
     e.preventDefault(); setIsDragging(false);
     const file = e.dataTransfer.files[0];
-    if (file && file.type.startsWith("video/")) {
+    if (file?.type.startsWith("video/")) {
       setVideoSrc(URL.createObjectURL(file));
       setAnnotations([]); setUndoStack([[]]); setUndoIndex(0);
+      setIsPlaying(false); setProgress(0); setCurrentTime(0);
     }
   };
 
-  const fmtTime = (s) => {
-    const m = Math.floor(s / 60), sec = Math.floor(s % 60);
-    return `${m}:${String(sec).padStart(2, "0")}`;
-  };
+  const fmtTime = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+  const fmtRec = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
   const toolDefs = [
-    { id: TOOLS.POINTER, svg: <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 0l16 12-7 2-4 8-5-22z"/></svg>, label: "選択" },
-    { id: TOOLS.ARROW, svg: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="4" y1="20" x2="20" y2="4"/><polyline points="9,4 20,4 20,15"/></svg>, label: "矢印" },
-    { id: TOOLS.LINE, svg: <svg viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5"><line x1="4" y1="20" x2="20" y2="4"/></svg>, label: "直線" },
-    { id: TOOLS.CIRCLE, svg: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><circle cx="12" cy="12" r="9"/></svg>, label: "楕円" },
-    { id: TOOLS.RECT, svg: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><rect x="3" y="5" width="18" height="14" rx="1"/></svg>, label: "四角" },
-    { id: TOOLS.ANGLE, svg: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M4 20 L4 4 L20 20"/></svg>, label: "角度" },
-    { id: TOOLS.FREEHAND, svg: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M3 17 Q6 10 10 14 Q14 18 18 8 Q20 4 21 7"/></svg>, label: "フリー" },
+    { id: TOOLS.POINTER,  icon: "↖", label: "選択" },
+    { id: TOOLS.ARROW,    icon: "↗", label: "矢印" },
+    { id: TOOLS.LINE,     icon: "╱", label: "直線" },
+    { id: TOOLS.CIRCLE,   icon: "○", label: "楕円" },
+    { id: TOOLS.RECT,     icon: "□", label: "四角" },
+    { id: TOOLS.ANGLE,    icon: "∠", label: "角度" },
+    { id: TOOLS.FREEHAND, icon: "✏", label: "フリー" },
+    { id: TOOLS.TEXT,     icon: "T",  label: "テキスト" },
   ];
 
-  const cursor = tool === TOOLS.POINTER ? "default" : tool === TOOLS.ANGLE ? "crosshair" : "crosshair";
+  const cursor = tool === TOOLS.POINTER ? "default" : tool === TOOLS.TEXT ? "text" : "crosshair";
 
   return (
-    <div style={{ minHeight: "100vh", background: "#0a0c10", color: "#e8eaf0", fontFamily: "'Courier New', 'Consolas', monospace", display: "flex", flexDirection: "column", userSelect: "none" }}>
+    <div style={S.root}>
       {/* Header */}
-      <div style={{ background: "linear-gradient(135deg, #0d1117 0%, #161b22 100%)", borderBottom: "1px solid #21262d", padding: "10px 20px", display: "flex", alignItems: "center", gap: 16 }}>
+      <div style={S.header}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ width: 32, height: 32, borderRadius: 8, background: "linear-gradient(135deg, #00e676, #00b248)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>⚾</div>
+          <div style={S.logo}>⚾</div>
           <div>
-            <div style={{ fontSize: 14, fontWeight: 700, letterSpacing: 2, color: "#00e676" }}>WISE BASEBALL ACADEMY</div>
-            <div style={{ fontSize: 10, color: "#6e7681", letterSpacing: 1 }}>COACHING ANALYZER</div>
+            <div style={S.logoTitle}>WISE BASEBALL ACADEMY</div>
+            <div style={S.logoSub}>COACHING ANALYZER</div>
           </div>
         </div>
         <div style={{ flex: 1 }} />
         {videoSrc && (
-          <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={exportFrame} style={{ background: "linear-gradient(135deg, #00e676, #00b248)", border: "none", borderRadius: 6, padding: "7px 14px", color: "#000", fontWeight: 700, cursor: "pointer", fontSize: 12, letterSpacing: 1 }}>📸 フレーム保存</button>
-            <button onClick={() => fileInputRef.current?.click()} style={{ background: "#21262d", border: "1px solid #30363d", borderRadius: 6, padding: "7px 14px", color: "#c9d1d9", fontWeight: 600, cursor: "pointer", fontSize: 12 }}>📂 別動画</button>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            {recState === "idle" && (
+              <button onClick={startRecording} style={{ ...S.btn, borderColor: "#ff4444", color: "#ff4444", background: "rgba(255,68,68,0.1)" }}>
+                🎙 解説録画
+              </button>
+            )}
+            {recState === "recording" && (
+              <>
+                <span style={{ fontSize: 11, color: "#ff4444", fontWeight: 700 }}>● REC {fmtRec(recTime)}</span>
+                <button onClick={stopRecording} style={{ ...S.btn, borderColor: "#ff4444", color: "#ff4444" }}>⏹ 停止</button>
+              </>
+            )}
+            {recState === "preview" && (
+              <>
+                <button onClick={downloadRecording} style={S.btnPrimary}>📥 動画DL (LINE送信用)</button>
+                <button onClick={discardRecording} style={S.btn}>✕ 破棄</button>
+              </>
+            )}
+            <div style={S.divider} />
+            <button onClick={exportFrame} style={S.btnPrimary}>📸 フレーム保存</button>
+            <button onClick={() => fileInputRef.current?.click()} style={S.btn}>📂 別動画</button>
           </div>
         )}
       </div>
 
       <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
-        {/* Left Tools Panel */}
+        {/* Toolbar */}
         {videoSrc && (
-          <div style={{ width: 60, background: "#0d1117", borderRight: "1px solid #21262d", display: "flex", flexDirection: "column", alignItems: "center", padding: "12px 0", gap: 4 }}>
+          <div style={S.toolbar}>
             {toolDefs.map(t => (
-              <button key={t.id} title={t.label} onClick={() => { setTool(t.id); setAnglePoints([]); setCurrentShape(null); }}
-                style={{ width: 42, height: 42, borderRadius: 8, border: tool === t.id ? "2px solid #00e676" : "1px solid #21262d", background: tool === t.id ? "rgba(0,230,118,0.12)" : "transparent", color: tool === t.id ? "#00e676" : "#8b949e", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 8, transition: "all 0.15s" }}>
-                {t.svg}
+              <button key={t.id} title={t.label}
+                onClick={() => { setTool(t.id); setAnglePoints([]); setCurrentShape(null); setTextPos(null); }}
+                style={{ ...S.toolBtn, ...(tool === t.id ? S.toolBtnActive : {}) }}>
+                <span style={{ fontSize: t.id === TOOLS.TEXT ? 16 : 18, fontWeight: 700 }}>{t.icon}</span>
               </button>
             ))}
-            <div style={{ width: 32, height: 1, background: "#21262d", margin: "6px 0" }} />
-            {/* Colors */}
+            <div style={S.sep} />
             {PRESET_COLORS.map(c => (
               <button key={c} onClick={() => setColor(c)}
-                style={{ width: 26, height: 26, borderRadius: "50%", border: color === c ? "2px solid #fff" : "2px solid transparent", background: c, cursor: "pointer", boxSizing: "border-box", transition: "transform 0.1s", transform: color === c ? "scale(1.15)" : "scale(1)" }} />
+                style={{ ...S.colorBtn, background: c, outline: color === c ? "3px solid #fff" : "none", outlineOffset: 2 }} />
             ))}
-            <div style={{ width: 32, height: 1, background: "#21262d", margin: "6px 0" }} />
-            {/* Stroke width */}
+            <div style={S.sep} />
             {[2, 4, 7].map(w => (
               <button key={w} onClick={() => setStrokeWidth(w)}
-                style={{ width: 36, height: 28, borderRadius: 5, border: strokeWidth === w ? "1px solid #00e676" : "1px solid #21262d", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                style={{ ...S.widthBtn, borderColor: strokeWidth === w ? "#00e676" : "#21262d" }}>
                 <div style={{ width: 20, height: w, borderRadius: w, background: strokeWidth === w ? "#00e676" : "#6e7681" }} />
               </button>
             ))}
-            <div style={{ width: 32, height: 1, background: "#21262d", margin: "6px 0" }} />
-            {/* Undo/Redo/Clear */}
+            <div style={S.sep} />
             <button title="元に戻す" onClick={undo} disabled={undoIndex === 0}
-              style={{ width: 42, height: 36, borderRadius: 7, border: "1px solid #21262d", background: "transparent", color: undoIndex === 0 ? "#3d444d" : "#8b949e", cursor: undoIndex === 0 ? "not-allowed" : "pointer", fontSize: 16 }}>↩</button>
+              style={{ ...S.toolBtn, color: undoIndex === 0 ? "#3d444d" : "#8b949e" }}>↩</button>
             <button title="やり直す" onClick={redo} disabled={undoIndex === undoStack.length - 1}
-              style={{ width: 42, height: 36, borderRadius: 7, border: "1px solid #21262d", background: "transparent", color: undoIndex === undoStack.length - 1 ? "#3d444d" : "#8b949e", cursor: undoIndex === undoStack.length - 1 ? "not-allowed" : "pointer", fontSize: 16 }}>↪</button>
-            <button title="全削除" onClick={clearAll}
-              style={{ width: 42, height: 36, borderRadius: 7, border: "1px solid #21262d", background: "transparent", color: "#ff4444", cursor: "pointer", fontSize: 14 }}>🗑</button>
+              style={{ ...S.toolBtn, color: undoIndex === undoStack.length - 1 ? "#3d444d" : "#8b949e" }}>↪</button>
+            <button title="全削除" onClick={clearAll} style={{ ...S.toolBtn, color: "#ff4444" }}>🗑</button>
           </div>
         )}
 
-        {/* Main Video Area */}
+        {/* Main */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
           {!videoSrc ? (
             <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}
               onDrop={handleDrop} onDragOver={e => { e.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)}>
               <div onClick={() => fileInputRef.current?.click()}
-                style={{ border: `2px dashed ${isDragging ? "#00e676" : "#30363d"}`, borderRadius: 16, padding: "60px 80px", textAlign: "center", cursor: "pointer", transition: "all 0.2s", background: isDragging ? "rgba(0,230,118,0.05)" : "transparent" }}>
-                <div style={{ fontSize: 56, marginBottom: 16 }}>🎬</div>
-                <div style={{ fontSize: 18, fontWeight: 700, color: isDragging ? "#00e676" : "#c9d1d9", marginBottom: 8 }}>動画をここにドロップ</div>
-                <div style={{ fontSize: 13, color: "#6e7681" }}>またはクリックしてファイルを選択</div>
-                <div style={{ marginTop: 20, display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
-                  {["MP4", "MOV", "AVI", "M4V"].map(f => (
-                    <span key={f} style={{ background: "#21262d", borderRadius: 4, padding: "3px 10px", fontSize: 11, color: "#8b949e", fontWeight: 600, letterSpacing: 1 }}>{f}</span>
-                  ))}
+                style={{ ...S.dropzone, borderColor: isDragging ? "#00e676" : "#30363d", background: isDragging ? "rgba(0,230,118,0.05)" : "transparent" }}>
+                <div style={{ fontSize: 52, marginBottom: 14 }}>🎬</div>
+                <div style={{ fontSize: 18, fontWeight: 700, color: isDragging ? "#00e676" : "#c9d1d9", marginBottom: 8 }}>動画をドロップ</div>
+                <div style={{ fontSize: 12, color: "#6e7681", marginBottom: 14 }}>またはクリックしてファイル選択</div>
+                <div style={{ display: "flex", gap: 6, justifyContent: "center", flexWrap: "wrap", marginBottom: 20 }}>
+                  {["MP4", "MOV", "AVI", "M4V"].map(f => <span key={f} style={S.badge}>{f}</span>)}
+                </div>
+                <div style={{ padding: "12px 18px", background: "rgba(0,230,118,0.07)", borderRadius: 8, borderLeft: "3px solid #00e676", textAlign: "left", maxWidth: 300 }}>
+                  <div style={{ fontSize: 11, color: "#00e676", fontWeight: 700, marginBottom: 5 }}>🎙 解説録画機能</div>
+                  <div style={{ fontSize: 11, color: "#8b949e", lineHeight: 1.7 }}>
+                    動画を見ながらコーチが音声解説を録音。<br />
+                    描画＋解説入り動画をLINEで共有できます。
+                  </div>
                 </div>
               </div>
             </div>
@@ -302,41 +432,77 @@ export default function CoachAnalyzer() {
             <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
               {/* Video + Canvas */}
               <div style={{ flex: 1, position: "relative", display: "flex", alignItems: "center", justifyContent: "center", background: "#000", overflow: "hidden" }}>
-                <div style={{ position: "relative", maxWidth: "100%", maxHeight: "100%" }}>
-                  <video ref={videoRef} src={videoSrc} style={{ display: "block", maxWidth: "100%", maxHeight: "calc(100vh - 180px)", objectFit: "contain" }}
-                    onLoadedMetadata={handleVideoLoad} onTimeUpdate={handleTimeUpdate} onEnded={() => setIsPlaying(false)} playsInline />
-                  <canvas ref={canvasRef} style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", cursor }} onMouseDown={handleDown} onMouseMove={handleMove} onMouseUp={handleUp} onMouseLeave={handleUp} />
+                <div style={{ position: "relative", display: "inline-block", maxWidth: "100%", maxHeight: "calc(100vh - 170px)" }}>
+                  <video
+                    ref={videoRef}
+                    src={videoSrc}
+                    style={{ display: "block", maxWidth: "100%", maxHeight: "calc(100vh - 170px)", objectFit: "contain" }}
+                    onLoadedMetadata={handleVideoLoad}
+                    onTimeUpdate={handleTimeUpdate}
+                    onEnded={() => setIsPlaying(false)}
+                    onPlay={() => setIsPlaying(true)}
+                    onPause={() => setIsPlaying(false)}
+                    playsInline
+                    preload="auto"
+                  />
+                  <canvas
+                    ref={canvasRef}
+                    style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", cursor }}
+                    onMouseDown={handleDown} onMouseMove={handleMove} onMouseUp={handleUp} onMouseLeave={handleUp}
+                    onTouchStart={handleDown} onTouchMove={handleMove} onTouchEnd={handleUp}
+                  />
+                  {/* Text input overlay */}
+                  {textPos && (
+                    <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none" }}>
+                      <div style={{ position: "absolute", top: `${textPos.y / videoSize.h * 100}%`, left: `${textPos.x / videoSize.w * 100}%`, pointerEvents: "all" }}>
+                        <input ref={textInputRef} value={textInput}
+                          onChange={e => setTextInput(e.target.value)}
+                          onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); commitText(); } if (e.key === "Escape") { setTextPos(null); setTextInput(""); } }}
+                          placeholder="テキスト → Enter"
+                          style={{ background: "rgba(0,0,0,0.8)", border: `1px solid ${color}`, borderRadius: 4, color, padding: "4px 8px", fontSize: 14, fontFamily: "monospace", fontWeight: 700, outline: "none", minWidth: 160 }}
+                        />
+                      </div>
+                    </div>
+                  )}
                   {/* Angle hint */}
                   {tool === TOOLS.ANGLE && anglePoints.length > 0 && (
-                    <div style={{ position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)", background: "rgba(0,0,0,0.7)", borderRadius: 6, padding: "5px 12px", fontSize: 12, color: "#00e676", border: "1px solid rgba(0,230,118,0.3)" }}>
-                      {anglePoints.length === 1 ? "▶ 頂点をクリック" : "▶ 2本目の辺をクリック"}
+                    <div style={S.hint}>{anglePoints.length === 1 ? "▶ 頂点をクリック" : "▶ 2本目の辺をクリック"}</div>
+                  )}
+                  {/* Rec indicator */}
+                  {recState === "recording" && (
+                    <div style={{ position: "absolute", top: 10, right: 10, background: "rgba(200,0,0,0.85)", borderRadius: 6, padding: "4px 10px", fontSize: 12, color: "#fff", fontWeight: 700 }}>
+                      ● REC {fmtRec(recTime)}
+                    </div>
+                  )}
+                  {micError && recState === "recording" && (
+                    <div style={{ position: "absolute", top: 40, right: 10, background: "rgba(255,165,0,0.9)", borderRadius: 6, padding: "3px 8px", fontSize: 11, color: "#000" }}>
+                      ⚠ マイク未接続 (映像のみ録画)
                     </div>
                   )}
                 </div>
               </div>
 
               {/* Controls */}
-              <div style={{ background: "#0d1117", borderTop: "1px solid #21262d", padding: "10px 16px" }}>
-                {/* Seekbar */}
-                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-                  <span style={{ fontSize: 11, color: "#8b949e", minWidth: 38, textAlign: "right" }}>{fmtTime(currentTime)}</span>
-                  <div onClick={seek} style={{ flex: 1, height: 6, background: "#21262d", borderRadius: 3, cursor: "pointer", position: "relative", overflow: "hidden" }}>
-                    <div style={{ width: `${progress}%`, height: "100%", background: "linear-gradient(90deg, #00e676, #00b248)", borderRadius: 3, transition: "width 0.1s" }} />
+              <div style={S.controls}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                  <span style={S.timeLabel}>{fmtTime(currentTime)}</span>
+                  <div onClick={seek} style={S.seekBar}>
+                    <div style={{ width: `${progress}%`, height: "100%", background: "linear-gradient(90deg,#00e676,#00b248)", borderRadius: 3 }} />
                   </div>
-                  <span style={{ fontSize: 11, color: "#8b949e", minWidth: 38 }}>{fmtTime(duration)}</span>
+                  <span style={S.timeLabel}>{fmtTime(duration)}</span>
                 </div>
-                {/* Buttons */}
-                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                  <button onClick={() => stepFrame(false)} style={ctrlBtn}>⏮ -1f</button>
-                  <button onClick={togglePlay} style={{ ...ctrlBtn, background: isPlaying ? "rgba(255,68,68,0.15)" : "rgba(0,230,118,0.15)", borderColor: isPlaying ? "#ff4444" : "#00e676", color: isPlaying ? "#ff4444" : "#00e676", minWidth: 70, fontWeight: 700 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  <button onClick={() => stepFrame(false)} style={S.ctrlBtn}>⏮ -1f</button>
+                  <button onClick={togglePlay}
+                    style={{ ...S.ctrlBtn, minWidth: 80, fontWeight: 700, borderColor: isPlaying ? "#ff4444" : "#00e676", color: isPlaying ? "#ff4444" : "#00e676", background: isPlaying ? "rgba(255,68,68,0.1)" : "rgba(0,230,118,0.1)" }}>
                     {isPlaying ? "⏸ 停止" : "▶ 再生"}
                   </button>
-                  <button onClick={() => stepFrame(true)} style={ctrlBtn}>+1f ⏭</button>
-                  <div style={{ width: 1, height: 28, background: "#21262d", margin: "0 4px" }} />
-                  <span style={{ fontSize: 11, color: "#6e7681", marginRight: 2 }}>速度</span>
+                  <button onClick={() => stepFrame(true)} style={S.ctrlBtn}>+1f ⏭</button>
+                  <div style={S.divider} />
+                  <span style={{ fontSize: 11, color: "#6e7681" }}>速度</span>
                   {SPEEDS.map(s => (
                     <button key={s.value} onClick={() => setSpeed(s.value)}
-                      style={{ ...ctrlBtn, background: speed === s.value ? "rgba(0,230,118,0.15)" : "transparent", borderColor: speed === s.value ? "#00e676" : "#30363d", color: speed === s.value ? "#00e676" : "#8b949e", minWidth: 44 }}>
+                      style={{ ...S.ctrlBtn, minWidth: 44, borderColor: speed === s.value ? "#00e676" : "#30363d", color: speed === s.value ? "#00e676" : "#8b949e", background: speed === s.value ? "rgba(0,230,118,0.1)" : "transparent" }}>
                       {s.label}
                     </button>
                   ))}
@@ -349,21 +515,40 @@ export default function CoachAnalyzer() {
 
       <input ref={fileInputRef} type="file" accept="video/*" style={{ display: "none" }} onChange={handleFile} />
 
-      {/* Status bar */}
       {videoSrc && (
-        <div style={{ background: "#0d1117", borderTop: "1px solid #21262d", padding: "4px 16px", display: "flex", gap: 20, fontSize: 11, color: "#6e7681" }}>
-          <span>解像度: {videoSize.w}×{videoSize.h}</span>
+        <div style={S.statusBar}>
+          <span>{videoSize.w}x{videoSize.h}</span>
           <span>速度: {speed}x</span>
           <span>ツール: {toolDefs.find(t => t.id === tool)?.label}</span>
-          <span>描画数: {annotations.length}</span>
-          {tool === TOOLS.ANGLE && anglePoints.length > 0 && <span style={{ color: "#00e676" }}>角度計測: {anglePoints.length}/3点</span>}
+          <span>描画: {annotations.length}</span>
+          {recState === "preview" && <span style={{ color: "#00e676" }}>✅ 録画完了 - ダウンロードしてLINEで送信</span>}
         </div>
       )}
     </div>
   );
 }
 
-const ctrlBtn = {
-  background: "transparent", border: "1px solid #30363d", borderRadius: 6, padding: "5px 12px",
-  color: "#8b949e", cursor: "pointer", fontSize: 12, fontFamily: "inherit", fontWeight: 600, whiteSpace: "nowrap"
+const S = {
+  root: { minHeight: "100vh", maxHeight: "100vh", background: "#0a0c10", color: "#e8eaf0", fontFamily: "'Courier New','Consolas',monospace", display: "flex", flexDirection: "column", userSelect: "none", overflow: "hidden" },
+  header: { background: "linear-gradient(135deg,#0d1117 0%,#161b22 100%)", borderBottom: "1px solid #21262d", padding: "10px 16px", display: "flex", alignItems: "center", gap: 12, flexShrink: 0 },
+  logo: { width: 32, height: 32, borderRadius: 8, background: "linear-gradient(135deg,#00e676,#00b248)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 },
+  logoTitle: { fontSize: 13, fontWeight: 700, letterSpacing: 2, color: "#00e676" },
+  logoSub: { fontSize: 10, color: "#6e7681", letterSpacing: 1 },
+  toolbar: { width: 56, background: "#0d1117", borderRight: "1px solid #21262d", display: "flex", flexDirection: "column", alignItems: "center", padding: "10px 0", gap: 3, flexShrink: 0, overflowY: "auto" },
+  toolBtn: { width: 40, height: 40, borderRadius: 8, border: "1px solid #21262d", background: "transparent", color: "#8b949e", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.12s" },
+  toolBtnActive: { border: "2px solid #00e676", background: "rgba(0,230,118,0.12)", color: "#00e676" },
+  colorBtn: { width: 24, height: 24, borderRadius: "50%", border: "none", cursor: "pointer" },
+  widthBtn: { width: 36, height: 26, borderRadius: 5, border: "1px solid", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" },
+  sep: { width: 30, height: 1, background: "#21262d", margin: "4px 0" },
+  dropzone: { border: "2px dashed", borderRadius: 16, padding: "48px 56px", textAlign: "center", cursor: "pointer", transition: "all 0.2s" },
+  badge: { display: "inline-block", background: "#21262d", borderRadius: 4, padding: "2px 8px", fontSize: 11, color: "#8b949e", fontWeight: 600 },
+  hint: { position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)", background: "rgba(0,0,0,0.75)", borderRadius: 6, padding: "5px 12px", fontSize: 12, color: "#00e676", border: "1px solid rgba(0,230,118,0.3)", whiteSpace: "nowrap" },
+  controls: { background: "#0d1117", borderTop: "1px solid #21262d", padding: "10px 14px", flexShrink: 0 },
+  seekBar: { flex: 1, height: 6, background: "#21262d", borderRadius: 3, cursor: "pointer", overflow: "hidden" },
+  timeLabel: { fontSize: 11, color: "#8b949e", minWidth: 36, textAlign: "center" },
+  ctrlBtn: { background: "transparent", border: "1px solid #30363d", borderRadius: 6, padding: "5px 10px", color: "#8b949e", cursor: "pointer", fontSize: 12, fontFamily: "inherit", fontWeight: 600, whiteSpace: "nowrap" },
+  btn: { background: "transparent", border: "1px solid #30363d", borderRadius: 6, padding: "6px 12px", color: "#8b949e", cursor: "pointer", fontSize: 12, fontFamily: "inherit", fontWeight: 600 },
+  btnPrimary: { background: "linear-gradient(135deg,#00e676,#00b248)", border: "none", borderRadius: 6, padding: "6px 14px", color: "#000", fontWeight: 700, cursor: "pointer", fontSize: 12, fontFamily: "inherit" },
+  divider: { width: 1, height: 24, background: "#21262d", margin: "0 2px" },
+  statusBar: { background: "#0d1117", borderTop: "1px solid #21262d", padding: "4px 14px", display: "flex", gap: 20, fontSize: 11, color: "#6e7681", flexShrink: 0 },
 };
